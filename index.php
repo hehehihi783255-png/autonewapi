@@ -9,9 +9,9 @@ $CFG = [
     'game' => [
         'login_url'      => 'https://apifo88daigia.tele68.com/api?c=3&un={USER}&pw={PASS_MD5}&cp=R&cl=R&pf=web&at=',
         'lobby_url'      => 'https://wlb.tele68.com/v1/lobby/auth/login?cp=R&cl=R&pf=web&at=',
-        'ws_host'        => 'wtx.tele68.com',
-        'ws_path'        => '/tx/',
-        'sessions_api'   => 'https://wtx.tele68.com/v1/tx/sessions',
+        'ws_host'        => 'wtxmd52.tele68.com',
+        'ws_path'        => '/txmd5/',
+        'sessions_api'   => 'https://wtxmd52.tele68.com/v1/txmd5/sessions',
         'prediction_api' => 'https://new-lc79md5-s2king.onrender.com',
     ],
     'security' => [
@@ -80,7 +80,6 @@ function http_request(string $url, array $options = []): ?string {
         }
     }
 
-    // Fallback to file_get_contents if curl fails or unavailable
     $opts = [
         'http' => [
             'method' => $method,
@@ -252,7 +251,6 @@ function fetch_prediction_api(): ?array {
     global $CFG;
     $raw = http_request($CFG['game']['prediction_api'], ['timeout' => 10]);
     if (!$raw) {
-        // Try once more after brief pause (handles Render cold start)
         usleep(500000);
         $raw = http_request($CFG['game']['prediction_api'], ['timeout' => 10]);
     }
@@ -260,12 +258,10 @@ function fetch_prediction_api(): ?array {
     
     $j = json_decode($raw, true);
     if (!is_array($j)) {
-        // Try cleaning potential BOM or extra whitespaces
         $j = json_decode(trim($raw, "\xEF\xBB\xBF \t\n\r"), true);
     }
     if (!is_array($j)) return null;
     
-    // Normalize keys if needed (e.g. du_doan, phien_hien_tai, do_tin_cay)
     if (!isset($j['Du_doan'])) {
         foreach ($j as $k => $v) {
             $lk = strtolower($k);
@@ -380,7 +376,7 @@ class TinyWS {
     }
 }
 
-// ═══════ WS BET ═══════
+// ═══════ WS BET — MD5 NAMESPACE ═══════
 function do_ws_bet(string $key, array $s, array &$actions): bool {
     global $CFG;
     if (empty($s['token'])) return false;
@@ -403,17 +399,17 @@ function do_ws_bet(string $key, array $s, array &$actions): bool {
         if ($frames === []) continue;
         foreach ($frames as $pkt) {
             if ($pkt === '' || $pkt === null) continue;
-            if (str_starts_with($pkt, '0{')) { $ws->sendRaw('40/tx,' . $auth); continue; }
+            if (str_starts_with($pkt, '0{')) { $ws->sendRaw('40/txmd5,' . $auth); continue; }
             if ($pkt === '2') { $ws->sendRaw('3'); continue; }
             if ($pkt === '3' || $pkt === '6') continue;
             if ($pkt === '1') { $ws->close(); return false; }
             if (!str_starts_with($pkt, '4')) continue;
             $sio = substr($pkt, 1);
-            if (str_starts_with($sio, '0/tx,')) { $joined = true; continue; }
+            if (str_starts_with($sio, '0/txmd5,')) { $joined = true; continue; }
             if (str_starts_with($sio, '1') || str_starts_with($sio, '4')) { $ws->close(); return false; }
             if (!str_starts_with($sio, '2')) continue;
             $body = substr($sio, 1);
-            if (str_starts_with($body, '/tx,')) $body = substr($body, strlen('/tx,'));
+            if (str_starts_with($body, '/txmd5,')) $body = substr($body, strlen('/txmd5,'));
             $msg = json_decode($body, true);
             if (!is_array($msg) || count($msg) < 1) continue;
             $ev = $msg[0] ?? '';
@@ -423,7 +419,7 @@ function do_ws_bet(string $key, array $s, array &$actions): bool {
                 $tickSid = isset($d['id']) ? (int)$d['id'] : null;
                 if ($state === 'BETTING' && $joined && !$done) {
                     if ($tickSid !== null && $tickSid < $ps) continue;
-                    $ws->sendRaw('42/tx,' . json_encode(['bet', ['type'=>$side, 'amount'=>$amount]], JSON_UNESCAPED_UNICODE));
+                    $ws->sendRaw('42/txmd5,' . json_encode(['bet', ['type'=>$side, 'amount'=>$amount]], JSON_UNESCAPED_UNICODE));
                     $done = true;
                     key_log($key, 'success', "💰 ĐẶT #$ps [$side] × " . number_format($amount) . " — KHỚP $pred");
                     $actions[] = ['type'=>'bet', 'msg'=>"Bet #$ps $side $amount"];
@@ -443,7 +439,7 @@ function do_ws_bet(string $key, array $s, array &$actions): bool {
                             $s2 = substr($p2, 1);
                             if (!str_starts_with($s2, '2')) continue;
                             $b2 = substr($s2, 1);
-                            if (str_starts_with($b2, '/tx,')) $b2 = substr($b2, strlen('/tx,'));
+                            if (str_starts_with($b2, '/txmd5,')) $b2 = substr($b2, strlen('/txmd5,'));
                             $m2 = json_decode($b2, true);
                             if (!is_array($m2)) continue;
                             if (($m2[0] ?? '') === 'bet-result') {
@@ -475,7 +471,6 @@ function worker_step(string $key): array {
     $cfg = $s['config'] ?? [];
     if (empty($cfg['auto']) || !empty($cfg['paused'])) return $actions;
 
-    // Check profit target
     $pTarget = (int)($cfg['profit_stop'] ?? 0);
     $pTotal = (int)($s['profit_total'] ?? 0);
     if ($pTarget > 0 && $pTotal >= $pTarget && empty($s['pending_pred'])) {
@@ -532,7 +527,6 @@ function worker_step(string $key): array {
                         $d['loss_count_total'] = (int)($d['loss_count_total'] ?? 0) + 1;
                         $st++;
                         if ($st >= 3) {
-                            // ── lose 3 → skip 2 → resume at martingale ×2 ──
                             $d['skip_until_session'] = $sid + 2;
                             $st = 0;
                         }
@@ -637,8 +631,7 @@ function worker_step(string $key): array {
 
         $apiSession = (int)($predData['Phien_hien_tai'] ?? 0);
         if ($apiSession > 0 && $apiSession !== $nextSession) {
-            // Allow loose match or sync if API session differs slightly
-            // But let's log and proceed or match $nextSession
+            // Loose match allowed
         }
 
         $confidence = (string)($predData['Do_tin_cay'] ?? '');
