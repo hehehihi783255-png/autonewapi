@@ -5,7 +5,7 @@ RUN (php -m | grep -q '^posix$') || docker-php-ext-install posix
 
 WORKDIR /var/www/html
 
-COPY index2.php /var/www/html/index.php
+COPY index.php /var/www/html/index.php
 
 RUN mkdir -p /var/www/html/.data/by_key \
     && chmod -R 700 /var/www/html/.data
