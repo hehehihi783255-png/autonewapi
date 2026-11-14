@@ -50,8 +50,14 @@ if (!is_dir(KEY_DIR))  @mkdir(KEY_DIR, 0700, true);
 // ═══════ ROBUST HTTP HELPER (CURL WITH FALLBACK) ═══════
 function http_request(string $url, array $options = []): ?string {
     $method = strtoupper($options['method'] ?? 'GET');
-    $timeout = $options['timeout'] ?? 10;
-    $headers = $options['headers'] ?? ["User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept: application/json, text/plain, */*"];
+    $timeout = $options['timeout'] ?? 15;
+    $connectTimeout = $options['connect_timeout'] ?? 10;
+    $headers = $options['headers'] ?? [
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept: application/json, text/plain, */*",
+        "Accept-Language: vi-VN,vi;q=0.9,en;q=0.8",
+        "Cache-Control: no-cache"
+    ];
     $postFields = $options['body'] ?? null;
 
     if (function_exists('curl_init')) {
@@ -59,33 +65,41 @@ function http_request(string $url, array $options = []): ?string {
         curl_setopt($ch, CURLOPT_URL, $url);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_MAXREDIRS, 5);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $connectTimeout);
         curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_ENCODING, '');
         curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
 
         if ($method === 'POST') {
             curl_setopt($ch, CURLOPT_POST, true);
-            if ($postFields) {
+            if ($postFields !== null) {
                 curl_setopt($ch, CURLOPT_POSTFIELDS, is_array($postFields) ? json_encode($postFields) : $postFields);
             }
         }
 
         $response = curl_exec($ch);
-        $err = curl_error($ch);
         curl_close($ch);
 
-        if ($response !== false && !empty($response)) {
+        if ($response !== false && trim($response) !== '') {
             return $response;
         }
     }
 
+    $headerStr = implode("\r\n", $headers);
+    if ($postFields !== null && stripos($headerStr, 'Content-Type:') === false) {
+        $headerStr .= "\r\nContent-Type: application/json";
+    }
     $opts = [
         'http' => [
             'method' => $method,
             'timeout' => $timeout,
             'ignore_errors' => true,
-            'header' => implode("\r\n", $headers) . ($postFields ? "\r\nContent-Type: application/json" : "")
+            'follow_location' => 1,
+            'max_redirects' => 5,
+            'header' => $headerStr
         ],
         'ssl' => [
             'verify_peer' => false,
@@ -93,12 +107,12 @@ function http_request(string $url, array $options = []): ?string {
             'allow_self_signed' => true
         ]
     ];
-    if ($postFields && $method === 'POST') {
+    if ($postFields !== null && $method === 'POST') {
         $opts['http']['content'] = is_array($postFields) ? json_encode($postFields) : $postFields;
     }
     $ctx = stream_context_create($opts);
     $raw = @file_get_contents($url, false, $ctx);
-    return ($raw !== false && $raw !== '') ? $raw : null;
+    return ($raw !== false && trim($raw) !== '') ? $raw : null;
 }
 
 // ═══════ AUTH ═══════
@@ -237,7 +251,7 @@ function game_login(string $u, string $p): array {
 
 function fetch_sessions_api(): ?array {
     global $CFG;
-    $raw = http_request($CFG['game']['sessions_api'], ['timeout' => 6]);
+    $raw = http_request($CFG['game']['sessions_api'], ['timeout' => 8]);
     if (!$raw) return null;
     $j = json_decode($raw, true);
     if (!is_array($j) || !isset($j['list'])) return null;
@@ -245,38 +259,107 @@ function fetch_sessions_api(): ?array {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🌐 FETCH PREDICTION FROM EXTERNAL API (ROBUST WITH MULTI-RETRY & FALLBACK)
+// 🌐 FETCH PREDICTION FROM EXTERNAL API (FIXED RENDER COLD START & SCHEMA PARSING)
 // ═══════════════════════════════════════════════════════════════
+function parse_prediction_payload($node, int $depth = 0): ?array {
+    if (!is_array($node) || $depth > 4) return null;
+
+    $pred = null;
+    $sess = 0;
+    $conf = '';
+
+    $predKeys = ['du_doan', 'dudoan', 'prediction', 'predict', 'ket_qua_du_doan', 'result', 'side', 'choice', 'bet', 'signal', 'kq'];
+    $sessKeys = ['phien_hien_tai', 'phien_tiep_theo', 'next_session', 'phien', 'session', 'session_id', 'id', 'round', 'sid'];
+    $confKeys = ['do_tin_cay', 'tin_cay', 'confidence', 'ty_le', 'rate', 'accuracy', 'percent', 'prob', 'score'];
+
+    foreach ($node as $k => $v) {
+        if (!is_scalar($v)) continue;
+        $lk = strtolower(trim((string)$k));
+        $sv = trim((string)$v);
+        if ($sv === '') continue;
+
+        if ($pred === null && in_array($lk, $predKeys, true)) {
+            $pred = $sv;
+        } elseif ($sess === 0 && in_array($lk, $sessKeys, true)) {
+            $num = (int)preg_replace('/\D+/', '', $sv);
+            if ($num > 0) $sess = $num;
+        } elseif ($conf === '' && in_array($lk, $confKeys, true)) {
+            $conf = $sv;
+        }
+    }
+
+    if ($pred !== null) {
+        return [
+            'Du_doan'        => $pred,
+            'Phien_hien_tai' => $sess,
+            'Do_tin_cay'     => $conf,
+        ];
+    }
+
+    foreach ($node as $v) {
+        if (is_array($v)) {
+            $found = parse_prediction_payload($v, $depth + 1);
+            if ($found !== null) return $found;
+        }
+    }
+
+    return null;
+}
+
+function normalize_prediction_side(string $rawPred): ?string {
+    $clean = trim($rawPred);
+    if ($clean === '') return null;
+    $upper = mb_strtoupper($clean, 'UTF-8');
+    if (in_array($upper, ['TÀI', 'TAI', 'T', 'BIG', 'OVER', '1'], true) || preg_match('/\b(TÀI|TAI)\b/u', $upper)) {
+        return 'Tài';
+    }
+    if (in_array($upper, ['XỈU', 'XIU', 'X', 'SMALL', 'UNDER', '0', '2'], true) || preg_match('/\b(XỈU|XIU)\b/u', $upper)) {
+        return 'Xỉu';
+    }
+    return null;
+}
+
 function fetch_prediction_api(): ?array {
     global $CFG;
-    $raw = http_request($CFG['game']['prediction_api'], ['timeout' => 10]);
-    if (!$raw) {
-        usleep(500000);
-        $raw = http_request($CFG['game']['prediction_api'], ['timeout' => 10]);
+    $baseUrl = trim($CFG['game']['prediction_api']);
+    $urls = [$baseUrl];
+    if (substr($baseUrl, -1) !== '/') {
+        $urls[] = $baseUrl . '/api';
+        $urls[] = $baseUrl . '/predict';
     }
-    if (!$raw) return null;
-    
-    $j = json_decode($raw, true);
-    if (!is_array($j)) {
-        $j = json_decode(trim($raw, "\xEF\xBB\xBF \t\n\r"), true);
-    }
-    if (!is_array($j)) return null;
-    
-    if (!isset($j['Du_doan'])) {
-        foreach ($j as $k => $v) {
-            $lk = strtolower($k);
-            if ($lk === 'du_doan' || $lk === 'dudoan' || $lk === 'prediction') {
-                $j['Du_doan'] = $v;
-            } elseif ($lk === 'phien_hien_tai' || $lk === 'phien' || $lk === 'session') {
-                $j['Phien_hien_tai'] = $v;
-            } elseif ($lk === 'do_tin_cay' || $lk === 'confidence') {
-                $j['Do_tin_cay'] = $v;
+
+    foreach ($urls as $idx => $url) {
+        $timeout = ($idx === 0) ? 28 : 12;
+        $raw = http_request($url, ['timeout' => $timeout, 'connect_timeout' => 15]);
+        if (!$raw && $idx === 0) {
+            usleep(600000);
+            $raw = http_request($url, ['timeout' => 28, 'connect_timeout' => 15]);
+        }
+        if (!$raw) continue;
+
+        $trimmed = trim($raw, "\xEF\xBB\xBF \t\n\r\0\x0B");
+        $j = json_decode($trimmed, true);
+
+        if (!is_array($j)) {
+            if (preg_match('/\{.*\}/s', $trimmed, $m)) {
+                $j = json_decode($m[0], true);
+            }
+        }
+
+        if (is_array($j)) {
+            $parsed = parse_prediction_payload($j);
+            if ($parsed !== null && normalize_prediction_side((string)$parsed['Du_doan']) !== null) {
+                return $parsed;
+            }
+        } else {
+            $side = normalize_prediction_side($trimmed);
+            if ($side !== null) {
+                return ['Du_doan' => $side, 'Phien_hien_tai' => 0, 'Do_tin_cay' => ''];
             }
         }
     }
-    
-    if (!isset($j['Du_doan'])) return null;
-    return $j;
+
+    return null;
 }
 
 // ═══════ TINY WS ═══════
@@ -620,18 +703,11 @@ function worker_step(string $key): array {
         }
 
         $rawPred = trim((string)($predData['Du_doan'] ?? ''));
-        $predStr = null;
-        if (preg_match('/^t[aàá]i$/iu', $rawPred)) $predStr = 'Tài';
-        elseif (preg_match('/^x[iỉí]u$/iu', $rawPred)) $predStr = 'Xỉu';
+        $predStr = normalize_prediction_side($rawPred);
 
         if (!$predStr) {
             key_log($key, 'warn', '⚠️ Dự đoán API không hợp lệ: ' . ($rawPred ?: 'empty'));
             return $actions;
-        }
-
-        $apiSession = (int)($predData['Phien_hien_tai'] ?? 0);
-        if ($apiSession > 0 && $apiSession !== $nextSession) {
-            // Loose match allowed
         }
 
         $confidence = (string)($predData['Do_tin_cay'] ?? '');
@@ -754,9 +830,11 @@ function spawn_worker_async(string $key): void {
         if ($pid > 0 && function_exists('posix_kill') && @posix_kill($pid, 0)) return;
     }
     $scheme = 'http';
-    if (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') $scheme = 'https';
+    if ((isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')) {
+        $scheme = 'https';
+    }
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-    $path = $_SERVER['SCRIPT_NAME'] ?? '/index3.php';
+    $path = $_SERVER['SCRIPT_NAME'] ?? ('/' . basename(__FILE__));
     $url = "$scheme://$host$path?action=worker&key=" . urlencode($key) . "&max=3600";
     if (function_exists('exec') && !in_array('exec', array_map('trim', explode(',', (string)ini_get('disable_functions'))))) {
         $php = PHP_BINARY ?: 'php';
@@ -765,15 +843,16 @@ function spawn_worker_async(string $key): void {
         return;
     }
     if (function_exists('shell_exec') && !in_array('shell_exec', array_map('trim', explode(',', (string)ini_get('disable_functions'))))) {
-        @shell_exec("curl -s --max-time 2 " . escapeshellarg($url) . " > /dev/null 2>&1 &");
+        @shell_exec("curl -k -s --max-time 2 " . escapeshellarg($url) . " > /dev/null 2>&1 &");
         return;
     }
     if (function_exists('fsockopen')) {
         $parsed = parse_url($url);
         $h = $parsed['host'] ?? $host;
-        $port = 80;
-        if (($parsed['scheme'] ?? 'http') === 'https') $port = 443;
-        $fp = @fsockopen($h, $port, $en, $es, 0.5);
+        $isHttps = (($parsed['scheme'] ?? 'http') === 'https');
+        $port = $isHttps ? 443 : 80;
+        $target = ($isHttps ? 'ssl://' : '') . $h;
+        $fp = @fsockopen($target, $port, $en, $es, 1.0);
         if ($fp) {
             stream_set_timeout($fp, 1);
             $p = ($parsed['path'] ?? '/') . '?' . ($parsed['query'] ?? '');
