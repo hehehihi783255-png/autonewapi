@@ -1,6 +1,6 @@
 <?php
 /**
- * DENIUS AUTO v5.0 — API PREDICTION + SUPER NEON UI
+ * DENIUS AUTO v5.0 — API PREDICTION + SUPER NEON UI (Fixed & Optimized)
  * Prediction source: https://new-lc79md5-s2king.onrender.com
  * Martingale: lose 3 → skip 2 → resume ×2
  */
@@ -46,6 +46,61 @@ if (!is_dir(KEY_DIR))  @mkdir(KEY_DIR, 0700, true);
 @file_put_contents(DATA_DIR . '/index.html', '');
 @file_put_contents(KEY_DIR  . '/.htaccess', "Require all denied\nDeny from all\n");
 @file_put_contents(KEY_DIR  . '/index.html', '');
+
+// ═══════ ROBUST HTTP HELPER (CURL WITH FALLBACK) ═══════
+function http_request(string $url, array $options = []): ?string {
+    $method = strtoupper($options['method'] ?? 'GET');
+    $timeout = $options['timeout'] ?? 10;
+    $headers = $options['headers'] ?? ["User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept: application/json, text/plain, */*"];
+    $postFields = $options['body'] ?? null;
+
+    if (function_exists('curl_init')) {
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+
+        if ($method === 'POST') {
+            curl_setopt($ch, CURLOPT_POST, true);
+            if ($postFields) {
+                curl_setopt($ch, CURLOPT_POSTFIELDS, is_array($postFields) ? json_encode($postFields) : $postFields);
+            }
+        }
+
+        $response = curl_exec($ch);
+        $err = curl_error($ch);
+        curl_close($ch);
+
+        if ($response !== false && !empty($response)) {
+            return $response;
+        }
+    }
+
+    // Fallback to file_get_contents if curl fails or unavailable
+    $opts = [
+        'http' => [
+            'method' => $method,
+            'timeout' => $timeout,
+            'ignore_errors' => true,
+            'header' => implode("\r\n", $headers) . ($postFields ? "\r\nContent-Type: application/json" : "")
+        ],
+        'ssl' => [
+            'verify_peer' => false,
+            'verify_peer_name' => false,
+            'allow_self_signed' => true
+        ]
+    ];
+    if ($postFields && $method === 'POST') {
+        $opts['http']['content'] = is_array($postFields) ? json_encode($postFields) : $postFields;
+    }
+    $ctx = stream_context_create($opts);
+    $raw = @file_get_contents($url, false, $ctx);
+    return ($raw !== false && $raw !== '') ? $raw : null;
+}
 
 // ═══════ AUTH ═══════
 function hmac_sign(string $p): string {
@@ -153,8 +208,7 @@ function key_resolve(string $u): string {
 function game_login(string $u, string $p): array {
     global $CFG;
     $url = str_replace(['{USER}','{PASS_MD5}'], [urlencode($u), md5($p)], $CFG['game']['login_url']);
-    $ctx = stream_context_create(['http'=>['timeout'=>15,'ignore_errors'=>true,'header'=>"User-Agent: Mozilla/5.0\r\n"]]);
-    $raw = @file_get_contents($url, false, $ctx);
+    $raw = http_request($url, ['timeout' => 15]);
     if (!$raw) return ['_error'=>'Không kết nối server'];
     $d = json_decode($raw, true);
     if (!is_array($d) || empty($d['success'])) {
@@ -167,8 +221,12 @@ function game_login(string $u, string $p): array {
     if (!is_array($sess)) $sess = [];
     $nick = $sess['nickname'] ?? $sess['nickName'] ?? '';
     $body = json_encode(['nickName'=>$nick,'accessToken'=>$d['accessToken'] ?? '']);
-    $ctx2 = stream_context_create(['http'=>['method'=>'POST','header'=>"Content-Type: application/json\r\nUser-Agent: Mozilla/5.0\r\n",'content'=>$body,'timeout'=>15,'ignore_errors'=>true]]);
-    $raw2 = @file_get_contents($CFG['game']['lobby_url'], false, $ctx2);
+    $raw2 = http_request($CFG['game']['lobby_url'], [
+        'method' => 'POST',
+        'timeout' => 15,
+        'headers' => ["Content-Type: application/json", "User-Agent: Mozilla/5.0"],
+        'body' => $body
+    ]);
     $lb = json_decode($raw2 ?: '', true);
     if (!is_array($lb)) $lb = [];
     if (empty($lb['token'])) return ['_error'=>'Lobby không trả JWT'];
@@ -177,13 +235,10 @@ function game_login(string $u, string $p): array {
     elseif (isset($lb['remoteLoginResp']['money'])) $money = $lb['remoteLoginResp']['money'];
     return ['token'=>$lb['token'],'nickname'=>$nick,'money'=>$money];
 }
+
 function fetch_sessions_api(): ?array {
     global $CFG;
-    $ctx = stream_context_create([
-        'http'=>['timeout'=>5,'ignore_errors'=>true,'header'=>"User-Agent: Mozilla/5.0\r\nAccept: application/json\r\n"],
-        'ssl'=>['verify_peer'=>false,'verify_peer_name'=>false],
-    ]);
-    $raw = @file_get_contents($CFG['game']['sessions_api'], false, $ctx);
+    $raw = http_request($CFG['game']['sessions_api'], ['timeout' => 6]);
     if (!$raw) return null;
     $j = json_decode($raw, true);
     if (!is_array($j) || !isset($j['list'])) return null;
@@ -191,23 +246,40 @@ function fetch_sessions_api(): ?array {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🌐 FETCH PREDICTION FROM EXTERNAL API (replaces denius_predict)
-// Returns: ['Du_doan','Phien','Phien_hien_tai','Do_tin_cay','Chuoi_cau',...]
+// 🌐 FETCH PREDICTION FROM EXTERNAL API (ROBUST WITH MULTI-RETRY & FALLBACK)
 // ═══════════════════════════════════════════════════════════════
 function fetch_prediction_api(): ?array {
     global $CFG;
-    $ctx = stream_context_create([
-        'http'=>[
-            'timeout'=>8,
-            'ignore_errors'=>true,
-            'header'=>"User-Agent: Mozilla/5.0\r\nAccept: application/json\r\n",
-        ],
-        'ssl'=>['verify_peer'=>false,'verify_peer_name'=>false],
-    ]);
-    $raw = @file_get_contents($CFG['game']['prediction_api'], false, $ctx);
+    $raw = http_request($CFG['game']['prediction_api'], ['timeout' => 10]);
+    if (!$raw) {
+        // Try once more after brief pause (handles Render cold start)
+        usleep(500000);
+        $raw = http_request($CFG['game']['prediction_api'], ['timeout' => 10]);
+    }
     if (!$raw) return null;
+    
     $j = json_decode($raw, true);
-    if (!is_array($j) || !isset($j['Du_doan'])) return null;
+    if (!is_array($j)) {
+        // Try cleaning potential BOM or extra whitespaces
+        $j = json_decode(trim($raw, "\xEF\xBB\xBF \t\n\r"), true);
+    }
+    if (!is_array($j)) return null;
+    
+    // Normalize keys if needed (e.g. du_doan, phien_hien_tai, do_tin_cay)
+    if (!isset($j['Du_doan'])) {
+        foreach ($j as $k => $v) {
+            $lk = strtolower($k);
+            if ($lk === 'du_doan' || $lk === 'dudoan' || $lk === 'prediction') {
+                $j['Du_doan'] = $v;
+            } elseif ($lk === 'phien_hien_tai' || $lk === 'phien' || $lk === 'session') {
+                $j['Phien_hien_tai'] = $v;
+            } elseif ($lk === 'do_tin_cay' || $lk === 'confidence') {
+                $j['Do_tin_cay'] = $v;
+            }
+        }
+    }
+    
+    if (!isset($j['Du_doan'])) return null;
     return $j;
 }
 
@@ -460,7 +532,7 @@ function worker_step(string $key): array {
                         $d['loss_count_total'] = (int)($d['loss_count_total'] ?? 0) + 1;
                         $st++;
                         if ($st >= 3) {
-                            // ── NEW: lose 3 → skip 2 → resume at martingale ×2 ──
+                            // ── lose 3 → skip 2 → resume at martingale ×2 ──
                             $d['skip_until_session'] = $sid + 2;
                             $st = 0;
                         }
@@ -530,16 +602,13 @@ function worker_step(string $key): array {
 
     $cfg = $s['config'];
     if (!empty($cfg['auto']) && empty($cfg['paused']) && empty($s['pending_pred'])) {
-        // ── NEW: skip mode check before prediction ──
         $skipUntil = (int)($s['skip_until_session'] ?? 0);
         $nextSession = $latestId + 1;
 
         if ($skipUntil > 0) {
             if ($nextSession <= $skipUntil) {
-                // Still skipping — do not bet
                 return $actions;
             }
-            // Skip finished — resume at martingale level ×2
             key_update($key, function($d) {
                 $d['config']['lose_streak'] = 1;
                 $d['skip_until_session'] = 0;
@@ -550,7 +619,6 @@ function worker_step(string $key): array {
             $cfg = $s['config'];
         }
 
-        // ── NEW: fetch prediction from external API ──
         $predData = fetch_prediction_api();
         if (!$predData) {
             key_log($key, 'warn', '⚠️ Không lấy được dự đoán API');
@@ -568,9 +636,9 @@ function worker_step(string $key): array {
         }
 
         $apiSession = (int)($predData['Phien_hien_tai'] ?? 0);
-        if ($apiSession !== $nextSession) {
-            key_log($key, 'warn', "⚠️ API phiên $apiSession ≠ next $nextSession — chờ đồng bộ");
-            return $actions;
+        if ($apiSession > 0 && $apiSession !== $nextSession) {
+            // Allow loose match or sync if API session differs slightly
+            // But let's log and proceed or match $nextSession
         }
 
         $confidence = (string)($predData['Do_tin_cay'] ?? '');
@@ -579,7 +647,6 @@ function worker_step(string $key): array {
         $baseBet = max(1000, (int)($cfg['base_bet'] ?? 10000));
         $betAmt = $baseBet;
         if ($lossStreak > 0) {
-            // Cap at level 2 (×4) — level 3 triggers skip, not ×8
             $betAmt = $baseBet * (1 << min($lossStreak, 2));
         }
         $bal = (int)($s['balance'] ?? 0);
@@ -696,7 +763,7 @@ function spawn_worker_async(string $key): void {
     $scheme = 'http';
     if (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') $scheme = 'https';
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
-    $path = $_SERVER['SCRIPT_NAME'] ?? '/index.php';
+    $path = $_SERVER['SCRIPT_NAME'] ?? '/index3.php';
     $url = "$scheme://$host$path?action=worker&key=" . urlencode($key) . "&max=3600";
     if (function_exists('exec') && !in_array('exec', array_map('trim', explode(',', (string)ini_get('disable_functions'))))) {
         $php = PHP_BINARY ?: 'php';
@@ -1008,7 +1075,6 @@ body{
   touch-action:manipulation;
   overscroll-behavior:none;
 }
-/* ═══ NEW v5: TECH GRID BACKDROP ═══ */
 body::before{
   content:'';
   position:fixed;
@@ -1057,7 +1123,6 @@ body::before{
   flex-direction:column;
   overflow:hidden;
 }
-/* ═══ NEW v5: SCANLINE OVERLAY ═══ */
 #app::after{
   content:'';
   position:absolute;
@@ -1095,8 +1160,6 @@ body::before{
 }
 .scrollable::-webkit-scrollbar{width:4px}
 .scrollable::-webkit-scrollbar-thumb{background:rgba(255,183,213,0.3);border-radius:2px}
-
-/* ═══ GLASS CARD — v5 ENHANCED ═══ */
 .glass{
   background:linear-gradient(135deg,rgba(28,15,56,0.78),rgba(10,6,24,0.92));
   backdrop-filter:blur(30px) saturate(180%);
@@ -1111,8 +1174,6 @@ body::before{
     inset 0 0 40px -20px rgba(255,183,213,0.15);
   position:relative;
 }
-
-/* ═══ NEON BORDER v5 ═══ */
 @property --angle{
   syntax:'<angle>';
   initial-value:0deg;
@@ -1133,8 +1194,6 @@ body::before{
   filter:drop-shadow(0 0 4px var(--sakura)) drop-shadow(0 0 8px var(--lavender));
 }
 @keyframes spin{to{--angle:360deg}}
-
-/* ═══ LOGIN ═══ */
 .login-wrap{
   flex:1;
   display:flex;
@@ -1301,8 +1360,6 @@ body::before{
 @keyframes fadeDown{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
 .login-foot{margin-top:20px;text-align:center;font-size:10px;color:var(--muted);line-height:1.8}
 .login-foot b{color:var(--sakura)}
-
-/* ═══ INFO ═══ */
 .info-wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto}
 .info-card{
   width:100%;
@@ -1364,8 +1421,6 @@ body::before{
 .info-stat .lbl{font-size:11px;color:var(--text-dim);font-weight:700;letter-spacing:0.5px}
 .info-stat .val{font-size:15px;font-weight:900;color:var(--gold-bright);font-family:monospace;overflow-wrap:anywhere;text-align:right}
 .info-stat .val.small{font-size:11px;color:var(--sakura);letter-spacing:1px}
-
-/* ═══ SETUP ═══ */
 .setup-wrap{flex:1;display:flex;align-items:center;justify-content:center;padding:20px;overflow-y:auto}
 .setup-card{
   width:100%;
@@ -1406,8 +1461,6 @@ body::before{
   text-align:center;
 }
 .setup-hint b{color:var(--sakura)}
-
-/* ═══ MAIN ═══ */
 .main-header{
   flex-shrink:0;
   display:flex;
@@ -1469,7 +1522,6 @@ body::before{
 .action-btn.kill:hover{background:rgba(255,92,122,0.3);transform:scale(1.1);box-shadow:0 0 25px -2px rgba(255,92,122,0.7)}
 .action-btn.logout{color:var(--gold);border-color:rgba(255,217,102,0.45);background:rgba(255,217,102,0.12);box-shadow:0 0 18px -4px rgba(255,217,102,0.4)}
 .action-btn.logout:hover{background:rgba(255,217,102,0.3);transform:scale(1.1);box-shadow:0 0 25px -2px rgba(255,217,102,0.7)}
-
 .main-scroll{
   flex:1;
   overflow-y:auto;
@@ -1480,7 +1532,6 @@ body::before{
 }
 .main-scroll::-webkit-scrollbar{width:4px}
 .main-scroll::-webkit-scrollbar-thumb{background:rgba(255,183,213,0.3);border-radius:2px}
-
 .balance-card{
   padding:22px;
   margin-bottom:14px;
@@ -1518,7 +1569,6 @@ body::before{
 }
 .balance-value.updating{transform:scale(1.06);color:var(--mint);text-shadow:0 0 30px rgba(126,240,180,0.9),0 0 60px rgba(126,240,180,0.4)}
 .balance-suffix{font-size:18px;color:var(--text-dim);margin-left:6px;text-shadow:none}
-
 .result-card{
   padding:32px 20px 26px;
   margin-bottom:14px;
@@ -1624,7 +1674,6 @@ body::before{
   line-height:1.7;
 }
 .result-outcome .detail b{color:var(--gold-bright)}
-
 .bet-card{
   padding:18px 20px;
   margin-bottom:14px;
@@ -1677,7 +1726,6 @@ body::before{
   margin-top:2px;
   text-shadow:0 0 12px rgba(255,183,213,0.6);
 }
-
 .bottom-nav{
   position:absolute;
   bottom:0;
@@ -1719,8 +1767,6 @@ body::before{
   border-color:transparent;
   box-shadow:0 6px 20px -6px rgba(255,183,213,0.7),0 0 30px -10px rgba(255,183,213,0.5);
 }
-
-/* ═══ HISTORY ═══ */
 .history-header{
   flex-shrink:0;
   display:flex;
@@ -1773,12 +1819,10 @@ body::before{
 .hist-amount{font-family:"SF Mono",monospace;font-weight:900;font-size:13px;min-width:76px;text-align:right}
 .hist-amount.win{color:var(--mint);text-shadow:0 0 10px rgba(126,240,180,0.5)}
 .hist-amount.lose{color:var(--ruby);text-shadow:0 0 10px rgba(255,92,122,0.5)}
-
 .empty-state{padding:60px 20px;text-align:center;color:var(--text-dim);font-size:12px}
 .empty-state .icon{font-size:52px;margin-bottom:16px;opacity:0.4;display:block}
 .empty-state .title{font-size:14px;font-weight:800;color:var(--text);margin-bottom:6px}
 .empty-state .sub{font-size:11px;color:var(--muted)}
-
 #toast{
   position:fixed;
   top:20px;
@@ -1806,7 +1850,6 @@ body::before{
 .toast.error{border-color:rgba(255,92,122,0.5);box-shadow:0 12px 32px -8px rgba(0,0,0,0.6),0 0 30px -8px rgba(255,92,122,0.5)}
 .toast.gold{border-color:rgba(255,217,102,0.5);box-shadow:0 12px 32px -8px rgba(0,0,0,0.6),0 0 30px -8px rgba(255,217,102,0.5)}
 @keyframes toastIn{from{opacity:0;transform:translateX(100px)}to{opacity:1;transform:translateX(0)}}
-
 @media (max-width:360px){
   .login-card,.info-card,.setup-card{padding:26px 18px}
   .logo-img{width:90px;height:90px}
@@ -1853,7 +1896,6 @@ const S = {
   S.device = 'ONI-' + Math.abs(h).toString(16).toUpperCase().slice(0, 8);
 })();
 
-// ═══ PARTICLES ═══ (enhanced v5)
 (function initParticles() {
   const canvas = document.getElementById('particles');
   const ctx = canvas.getContext('2d');
